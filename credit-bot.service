@@ -1,0 +1,15 @@
+[Unit]
+Description=Credit Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/credit-bot
+EnvironmentFile=/home/ubuntu/credit-bot/.env
+ExecStart=/home/ubuntu/credit-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
