@@ -7,9 +7,10 @@ from aiogram.types import (
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📊 Статус"),           KeyboardButton(text="✅ Внести платёж")],
-            [KeyboardButton(text="💳 Кредиты и карты"),  KeyboardButton(text="📅 Календарь")],
-            [KeyboardButton(text="📋 История"),           KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="📊 Статус"),           KeyboardButton(text="💸 Кешфлоу")],
+            [KeyboardButton(text="✅ Внести платёж"),    KeyboardButton(text="💳 Кредиты и карты")],
+            [KeyboardButton(text="📅 Календарь"),        KeyboardButton(text="📋 История")],
+            [KeyboardButton(text="⚙️ Настройки")],
         ],
         resize_keyboard=True
     )
@@ -317,13 +318,6 @@ def statement_check_kb(credit_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="✅ Да, верно",          callback_data=f"stmt_ok:{credit_id}")],
         [InlineKeyboardButton(text="✍️ Нет, другая сумма", callback_data=f"stmt_wrong:{credit_id}")],
         [InlineKeyboardButton(text="◀️ Назад",              callback_data=f"credit_detail:{credit_id}")],
-    ])
-
-
-def statement_interest_kb(credit_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✍️ Ввести сумму процентов", callback_data=f"stmt_enter:{credit_id}")],
-        [InlineKeyboardButton(text="⏩ Пропустить",             callback_data=f"stmt_skip:{credit_id}")],
     ])
 
 

@@ -8,8 +8,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import BOT_TOKEN
 from database import Database
+import cashflow
 from scheduler import start_scheduler
-from states import AddCredit, AddReminder, ChangeBudget, ChangeMonthBudget, SetPriority, Onboarding, StatementCheck, EditCredit, Payment, PaydaySetup, EditPlan, EarlyPayment, CardExpense, SyncBalances
+from states import AddCredit, AddReminder, ChangeBudget, ChangeMonthBudget, SetPriority, Onboarding, EditCredit, Payment, PaydaySetup, EditPlan, EarlyPayment, CardExpense, SyncBalances
 from keyboards import (
     main_menu, credits_list_kb, credit_detail_kb, confirm_pay_kb, debt_check_kb,
     reminders_kb, reminders_menu_kb, general_reminders_kb, confirm_delete_kb,
@@ -810,11 +811,12 @@ async def _record_and_show_debt_check(
 ):
     """Записывает платёж в БД и показывает сообщение с проверкой остатка."""
     c = await db.get_credit(credit_id)
-    interest = calc_interest(c, c["debt"])
-    new_debt = max(0.0, c["debt"] + interest - payment)
+    # Проценты здесь не начисляем: банк начисляет их раз в месяц, и они приходят
+    # из выписок. Иначе при двух платежах в месяц проценты считаются дважды.
+    new_debt = max(0.0, c["debt"] - payment)
 
     await db.update_credit_debt(credit_id, new_debt, payment)
-    await db.record_payment(credit_id, user_id, payment, interest, new_debt)
+    await db.record_payment(credit_id, user_id, payment, 0.0, new_debt)
 
     if new_debt < 0.01:
         await send_fn(
@@ -831,7 +833,7 @@ async def _record_and_show_debt_check(
     await send_fn(
         f"✅ <b>Платёж записан!</b>\n\n"
         f"💳 <b>{c['name']}</b>\n"
-        f"💸 Внесено: <b>{payment:,.0f} ₽</b>  (из них % = {interest:,.0f} ₽)\n\n"
+        f"💸 Внесено: <b>{payment:,.0f} ₽</b>\n\n"
         f"По моим расчётам, сейчас осталось: <b>{new_debt:,.0f} ₽</b>\n\n"
         f"Это верно? Открой приложение банка и проверь.",
         parse_mode="HTML",
@@ -2234,19 +2236,15 @@ async def ob_rem_more(callback: CallbackQuery, state: FSMContext):
 
 # ─── Проверка выписки по кредитной карте ──────────────────────────────────────
 
+STMT_MOVED = (
+    "Проценты теперь берутся из выписок 📄\n\n"
+    "Просто перешли сюда PDF-выписку из банка — я сам посчитаю долг и проценты."
+)
+
+
 @router.callback_query(F.data.startswith("stmt_enter:"))
 async def stmt_enter(callback: CallbackQuery, state: FSMContext):
-    credit_id = int(callback.data.split(":")[1])
-    c = await db.get_credit(credit_id)
-    calc = calc_interest(c, c["debt"])
-    await state.update_data(stmt_credit_id=credit_id, stmt_calc_interest=calc)
-    await callback.message.edit_text(
-        f"✍️ Введи сумму процентов из приложения банка по карте "
-        f"<b>{c['name']}</b> (в ₽):\n\n"
-        f"Моя оценка: <b>{calc:,.0f} ₽</b>",
-        parse_mode="HTML"
-    )
-    await state.set_state(StatementCheck.amount)
+    await callback.message.edit_text(STMT_MOVED)
     await callback.answer()
 
 
@@ -2261,54 +2259,12 @@ async def stmt_skip(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("stmt_ok:"))
 async def stmt_ok(callback: CallbackQuery):
-    await callback.message.edit_text(
-        callback.message.text + "\n\n✅ <b>Отлично, данные актуальны!</b>",
-        parse_mode="HTML"
-    )
+    await callback.message.edit_text(STMT_MOVED)
 
 
 @router.callback_query(F.data.startswith("stmt_wrong:"))
 async def stmt_wrong(callback: CallbackQuery, state: FSMContext):
-    credit_id = int(callback.data.split(":")[1])
-    c = await db.get_credit(credit_id)
-    calc = calc_interest(c, c["debt"])
-    await state.update_data(stmt_credit_id=credit_id, stmt_calc_interest=calc)
-    await callback.message.edit_text(
-        f"✍️ Введи фактическую сумму процентов, которую начислил банк по карте "
-        f"<b>{c['name']}</b> (в ₽):\n\n"
-        f"Моя оценка была: <b>{calc:,.0f} ₽</b>",
-        parse_mode="HTML"
-    )
-    await state.set_state(StatementCheck.amount)
-
-
-@router.message(StatementCheck.amount)
-async def stmt_check_amount(message: Message, state: FSMContext):
-    try:
-        actual = float(message.text.replace(" ", "").replace(",", "."))
-        if actual < 0:
-            raise ValueError
-        data = await state.get_data()
-        credit_id = data["stmt_credit_id"]
-        calc = data["stmt_calc_interest"]
-        diff = actual - calc
-
-        await db.adjust_debt_by_interest_diff(credit_id, diff)
-        await state.clear()
-
-        c = await db.get_credit(credit_id)
-        sign = "+" if diff > 0 else ""
-        await message.answer(
-            f"✅ Обновлено!\n\n"
-            f"💳 <b>{c['name']}</b>\n"
-            f"📈 Фактические проценты: <b>{actual:,.0f} ₽</b>\n"
-            f"📊 Корректировка долга: <b>{sign}{diff:,.0f} ₽</b>\n"
-            f"💰 Новый остаток: <b>{c['debt']:,.0f} ₽</b>",
-            parse_mode="HTML",
-            reply_markup=main_menu()
-        )
-    except ValueError:
-        await message.answer("Введи сумму в рублях, например: <code>3200</code>", parse_mode="HTML")
+    await callback.message.edit_text(STMT_MOVED)
 
 
 # ─── Месячный план платежей ───────────────────────────────────────────────────
@@ -3335,6 +3291,8 @@ async def main():
     await db.setup()
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
+    cashflow.bind_db(db)
+    dp.include_router(cashflow.router)   # раньше основного: PDF не должны ловить FSM-хендлеры
     dp.include_router(router)
     await start_scheduler(bot, db)
     logger.info("Бот запущен")

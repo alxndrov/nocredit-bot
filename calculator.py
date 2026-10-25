@@ -97,7 +97,7 @@ def recalculate_schedule(credits: list, monthly_budget: float,
 
         # Если бюджет не покрывает даже минималки — распределяем пропорционально
         if budget_left < 0:
-            ratio = monthly_budget / total_min if total_min > 0 else 0
+            ratio = budget_this_month / total_min if total_min > 0 else 0
             for c in credits:
                 cid = c["id"]
                 d = credit_data[cid]

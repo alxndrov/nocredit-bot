@@ -55,10 +55,6 @@ class CardExpense(StatesGroup):
     amount = State()  # сумма расхода с карты
 
 
-class StatementCheck(StatesGroup):
-    amount = State()
-
-
 class EditCredit(StatesGroup):
     value    = State()   # одиночные поля: название, долг, ставка, день, приоритет
     min_type = State()   # шаг 1 редактирования минималки

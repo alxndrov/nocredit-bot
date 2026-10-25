@@ -79,39 +79,6 @@ async def check_and_send_reminders(bot: Bot, db):
             logger.error(f"Ошибка напоминания user={r['user_id']}: {e}")
 
 
-async def check_statement_days(bot: Bot, db):
-    """
-    Каждый день в 10:00 МСК проверяем карты, у которых вчера был день выписки.
-    Просим зайти в приложение банка и ввести фактически начисленные проценты.
-    """
-    from calculator import calc_interest
-    from keyboards import statement_interest_kb
-
-    now = datetime.now(tz=MOSCOW_TZ)
-    yesterday_day = (now - timedelta(days=1)).day
-    cards = await db.get_cards_for_statement_check()
-
-    for c in cards:
-        if c["statement_day"] != yesterday_day:
-            continue
-
-        interest = calc_interest(c, c["debt"])
-        text = (
-            f"📋 <b>Вчера была выписка по карте {c['name']}!</b>\n\n"
-            f"Зайди в приложение банка и посмотри, сколько процентов "
-            f"начислили за этот месяц.\n\n"
-            f"Моя оценка: <b>{interest:,.0f} ₽</b> "
-            f"({c['debt']:,.0f} ₽ × {c['rate_month']*100:.2f}%/мес)\n\n"
-            f"Введи фактическую сумму из банка:"
-        )
-        try:
-            await bot.send_message(c["user_id"], text, parse_mode="HTML",
-                                   reply_markup=statement_interest_kb(c["id"]))
-            logger.info(f"Statement interest check отправлен: user={c['user_id']} card={c['name']}")
-        except Exception as e:
-            logger.error(f"Ошибка statement check user={c['user_id']}: {e}")
-
-
 async def send_payday_notifications(bot: Bot, db):
     """
     Каждый день в 9:00 МСК: если у пользователя сегодня аванс или зарплата —
@@ -229,7 +196,7 @@ async def send_monthly_summary(bot: Bot, db):
 
 
 async def send_weekly_sync_reminder(bot: Bot, db):
-    """Каждый понедельник в 10:00 МСК: напоминание обновить остатки."""
+    """Каждый вторник в 9:00: напоминание прислать выписки."""
     users = await db.get_all_users()
     for u in users:
         user_id = u["user_id"]
@@ -242,9 +209,10 @@ async def send_weekly_sync_reminder(bot: Bot, db):
         try:
             await bot.send_message(
                 user_id,
-                "📋 <b>Напоминание</b>\n\n"
-                "Зайди в банк и сверь остатки по кредитам — "
-                "нажми кнопку ниже.",
+                "📄 <b>Пора прислать выписки</b>\n\n"
+                "Перешли сюда PDF-выписки по кредиткам из Т-Банка и ОТП — "
+                "обновлю долги, проценты и допишу операции в таблицу.\n\n"
+                "Для ОТП раз в месяц сверь «Весь долг» из приложения — кнопка ниже.",
                 parse_mode="HTML",
                 reply_markup=sync_kb
             )
@@ -258,13 +226,6 @@ async def start_scheduler(bot: Bot, db):
         trigger=CronTrigger(minute="*"),
         args=[bot, db],
         id="reminder_check",
-        replace_existing=True
-    )
-    scheduler.add_job(
-        check_statement_days,
-        trigger=CronTrigger(hour=10, minute=0),
-        args=[bot, db],
-        id="statement_check",
         replace_existing=True
     )
     scheduler.add_job(
@@ -289,4 +250,4 @@ async def start_scheduler(bot: Bot, db):
         replace_existing=True
     )
     scheduler.start()
-    logger.info("Планировщик запущен (напоминания каждую минуту, выписки в 10:00, зарплатные уведомления в 9:00, ежемесячный итог в 21:00, еженедельный sync в пн 10:00 МСК)")
+    logger.info("Планировщик запущен (напоминания каждую минуту, зарплатные уведомления в 9:00, ежемесячный итог в 21:00, напоминание о выписках во вт 9:00)")

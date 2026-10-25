@@ -6,3 +6,5 @@ __pycache__/
 bot.log
 *.log
 .claude/
+google-sa.json
+*.bak-*
