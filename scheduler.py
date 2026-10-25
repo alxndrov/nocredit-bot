@@ -1,7 +1,9 @@
+import calendar
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -31,7 +33,6 @@ async def check_and_send_reminders(bot: Bot, db):
         # Учитываем переход через начало месяца (например, платёж 2-го, напоминание за 3 дня = 29/30/31-е)
         if send_day <= 0:
             # Приблизительно — берём предыдущий месяц
-            import calendar
             prev_month = (now.month - 2) % 12 + 1
             prev_year = now.year if now.month > 1 else now.year - 1
             days_in_prev = calendar.monthrange(prev_year, prev_month)[1]
@@ -62,19 +63,196 @@ async def check_and_send_reminders(bot: Bot, db):
             f"📅 День платежа: <b>{payment_day}-е</b>\n"
             f"💰 Долг: <b>{credit['debt']:,.0f} ₽</b>\n"
             f"📈 % за месяц: <b>{interest:,.0f} ₽</b>\n"
-            f"✅ Минималка: <b>{min_pay:,.0f} ₽</b>\n\n"
-            f"Зайди в бот и отметь платёж кнопкой <b>✅ Внести платёж</b>"
+            f"✅ Минималка: <b>{min_pay:,.0f} ₽</b>"
         )
+        pay_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="✅ Внести платёж",
+                callback_data=f"pay:{credit['id']}"
+            )
+        ]])
 
         try:
-            await bot.send_message(r["user_id"], text, parse_mode="HTML")
+            await bot.send_message(r["user_id"], text, parse_mode="HTML", reply_markup=pay_kb)
             logger.info(f"Напоминание отправлено: user={r['user_id']} credit={credit['name']}")
         except Exception as e:
             logger.error(f"Ошибка напоминания user={r['user_id']}: {e}")
 
 
+async def check_statement_days(bot: Bot, db):
+    """
+    Каждый день в 10:00 МСК проверяем карты, у которых вчера был день выписки.
+    Просим зайти в приложение банка и ввести фактически начисленные проценты.
+    """
+    from calculator import calc_interest
+    from keyboards import statement_interest_kb
+
+    now = datetime.now(tz=MOSCOW_TZ)
+    yesterday_day = (now - timedelta(days=1)).day
+    cards = await db.get_cards_for_statement_check()
+
+    for c in cards:
+        if c["statement_day"] != yesterday_day:
+            continue
+
+        interest = calc_interest(c, c["debt"])
+        text = (
+            f"📋 <b>Вчера была выписка по карте {c['name']}!</b>\n\n"
+            f"Зайди в приложение банка и посмотри, сколько процентов "
+            f"начислили за этот месяц.\n\n"
+            f"Моя оценка: <b>{interest:,.0f} ₽</b> "
+            f"({c['debt']:,.0f} ₽ × {c['rate_month']*100:.2f}%/мес)\n\n"
+            f"Введи фактическую сумму из банка:"
+        )
+        try:
+            await bot.send_message(c["user_id"], text, parse_mode="HTML",
+                                   reply_markup=statement_interest_kb(c["id"]))
+            logger.info(f"Statement interest check отправлен: user={c['user_id']} card={c['name']}")
+        except Exception as e:
+            logger.error(f"Ошибка statement check user={c['user_id']}: {e}")
+
+
+async def send_payday_notifications(bot: Bot, db):
+    """
+    Каждый день в 9:00 МСК: если у пользователя сегодня аванс или зарплата —
+    отправляем ему список платежей на этот день из плана.
+    """
+    from calculator import generate_plan
+
+    now = datetime.now(tz=MOSCOW_TZ)
+    today_day = now.day
+    year = now.year
+    month = now.month
+
+    users = await db.get_users_with_payday_today(today_day)
+
+    for u in users:
+        if not u.get("payday_notify_enabled", 1):
+            continue
+        user_id   = u["user_id"]
+        payday_num = u["payday_num"]   # 1 = аванс, 2 = зарплата
+        budget    = u["monthly_budget"]
+
+        credits = await db.get_credits(user_id)
+        if not credits:
+            continue
+
+        # Берём план из БД или генерируем
+        plan = await db.get_monthly_plan(user_id, year, month)
+        if not plan:
+            p1_amount = u.get("payday1_amount") or budget
+            p2_amount = u.get("payday2_amount")
+            override = await db.get_budget_override(user_id, year, month)
+            plan = generate_plan(credits, budget, p1_amount, p2_amount,
+                                 first_month_budget=override)
+            if plan:
+                await db.save_monthly_plan(user_id, year, month, plan)
+
+        items = [a for a in plan if a["payday"] == payday_num]
+        if not items:
+            continue
+
+        cmap = {c["id"]: c for c in credits}
+        payday_label = "аванс" if payday_num == 1 else "зарплата"
+        total = sum(a["amount"] for a in items)
+
+        lines = [f"💰 <b>Сегодня {payday_label}!</b> Вот что нужно оплатить:\n"]
+        for a in items:
+            c = cmap.get(a["credit_id"])
+            if not c:
+                continue
+            icon = "💳" if c.get("credit_type") == "card" else "🏦"
+            lines.append(f"{icon} <b>{c['name']}</b> — <b>{a['amount']:,.0f} ₽</b>")
+        lines.append(f"\n💸 Итого: <b>{total:,.0f} ₽</b>")
+        lines.append("\nОткрой бот → ✅ Внести платёж, чтобы отметить оплату.")
+
+        try:
+            await bot.send_message(user_id, "\n".join(lines), parse_mode="HTML")
+            logger.info(f"Payday notification отправлен: user={user_id} payday={payday_num}")
+        except Exception as e:
+            logger.error(f"Ошибка payday notification user={user_id}: {e}")
+
+
+async def send_monthly_summary(bot: Bot, db):
+    """
+    Ежемесячный итог: запускается ежедневно в 21:00 МСК,
+    но отправляет сообщение только в последний день месяца.
+    """
+    import calendar as _cal
+    from calculator import recalculate_schedule
+
+    now = datetime.now(tz=MOSCOW_TZ)
+    last_day = _cal.monthrange(now.year, now.month)[1]
+    if now.day != last_day:
+        return
+
+    months_ru = ["январе", "феврале", "марте", "апреле", "мае", "июне",
+                 "июле", "августе", "сентябре", "октябре", "ноябре", "декабре"]
+    month_name = months_ru[now.month - 1]
+
+    users = await db.get_all_users()
+
+    for u in users:
+        user_id = u["user_id"]
+        credits = await db.get_credits(user_id)
+        if not credits:
+            continue
+
+        payments = await db.get_payments_for_month(user_id, now.year, now.month)
+        if not payments:
+            continue
+
+        total_paid     = sum(p["amount"]   for p in payments)
+        total_interest = sum(p["interest"] for p in payments)
+        principal_paid = total_paid - total_interest
+
+        schedule   = recalculate_schedule(credits, u["monthly_budget"],
+                                          first_month_budget=await db.get_budget_override(
+                                              user_id, now.year, now.month))
+        months_left = len(schedule)
+        total_debt  = sum(c["debt"] for c in credits)
+
+        text = (
+            f"📊 <b>Итоги за {month_name}!</b>\n\n"
+            f"💰 Внесено платежей: <b>{total_paid:,.0f} ₽</b>\n"
+            f"   из них % банку: <b>{total_interest:,.0f} ₽</b>\n"
+            f"   тело долга: <b>{principal_paid:,.0f} ₽</b>\n\n"
+            f"📉 Текущий долг: <b>{total_debt:,.0f} ₽</b>\n"
+            f"📅 До свободы осталось: <b>{months_left} мес.</b>\n\n"
+            f"💪 Так держать! Каждый платёж приближает тебя к финансовой свободе."
+        )
+        try:
+            await bot.send_message(user_id, text, parse_mode="HTML")
+            logger.info(f"Monthly summary отправлен: user={user_id}")
+        except Exception as e:
+            logger.error(f"Ошибка monthly summary user={user_id}: {e}")
+
+
+async def send_weekly_sync_reminder(bot: Bot, db):
+    """Каждый понедельник в 10:00 МСК: напоминание обновить остатки."""
+    users = await db.get_all_users()
+    for u in users:
+        user_id = u["user_id"]
+        credits = await db.get_credits(user_id)
+        if not credits:
+            continue
+        sync_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✏️ Обновить остатки", callback_data="start_sync_cb")
+        ]])
+        try:
+            await bot.send_message(
+                user_id,
+                "📋 <b>Напоминание</b>\n\n"
+                "Зайди в банк и сверь остатки по кредитам — "
+                "нажми кнопку ниже.",
+                parse_mode="HTML",
+                reply_markup=sync_kb
+            )
+        except Exception as e:
+            logger.error(f"Weekly sync reminder error user={user_id}: {e}")
+
+
 async def start_scheduler(bot: Bot, db):
-    # Проверяем каждую минуту
     scheduler.add_job(
         check_and_send_reminders,
         trigger=CronTrigger(minute="*"),
@@ -82,5 +260,33 @@ async def start_scheduler(bot: Bot, db):
         id="reminder_check",
         replace_existing=True
     )
+    scheduler.add_job(
+        check_statement_days,
+        trigger=CronTrigger(hour=10, minute=0),
+        args=[bot, db],
+        id="statement_check",
+        replace_existing=True
+    )
+    scheduler.add_job(
+        send_payday_notifications,
+        trigger=CronTrigger(hour=9, minute=0),
+        args=[bot, db],
+        id="payday_notify",
+        replace_existing=True
+    )
+    scheduler.add_job(
+        send_monthly_summary,
+        trigger=CronTrigger(hour=21, minute=0),
+        args=[bot, db],
+        id="monthly_summary",
+        replace_existing=True
+    )
+    scheduler.add_job(
+        send_weekly_sync_reminder,
+        trigger=CronTrigger(day_of_week="tue", hour=9, minute=0),
+        args=[bot, db],
+        id="weekly_sync_reminder",
+        replace_existing=True
+    )
     scheduler.start()
-    logger.info("Планировщик напоминаний запущен (проверка каждую минуту)")
+    logger.info("Планировщик запущен (напоминания каждую минуту, выписки в 10:00, зарплатные уведомления в 9:00, ежемесячный итог в 21:00, еженедельный sync в пн 10:00 МСК)")
