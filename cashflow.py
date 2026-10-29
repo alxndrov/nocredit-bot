@@ -1,33 +1,33 @@
 """
-Выписки и кешфлоу:
-  • приём PDF-выписок Т-Банка и ОТП → операции в БД, пересчёт долга, запись в таблицу cashflow;
-  • экран «💸 Кешфлоу»: месяц по таблице, что ушло в кредитки, проценты, лимиты, запас.
-Роутер подключается раньше основного, чтобы файлы не перехватывали FSM-хендлеры.
+Кешфлоу:
+  • обязательные ежемесячные расходы — разовый опрос и кнопка «➕ Добавить обязательный расход»;
+  • «💰 Пришла зарплата» — нерегулярный доход, сумма каждый раз своя;
+  • проверка раз в 4 дня: сколько денег на руках → вывод, успеваю ли до следующих платежей.
+Роутер подключается раньше основного, чтобы кнопки меню работали из любого состояния.
 """
-import asyncio
-import io
 import logging
-from datetime import date, timedelta
+import re
+from datetime import date, datetime, timedelta
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-import config  # noqa: F401  — загружает .env до чтения настроек таблицы
-import sheets
-from calculator import _next_payment_date, calc_min_payment
-from statements import BANK_TITLES, SHEET_ACCOUNTS, Txn, parse_statement, sheet_rows
+from calculator import calc_min_payment
+from forecast import analyze, mandatory_between
+from keyboards import main_menu
+
+# Кнопки главного меню не должны съедаться как ввод, пока бот ждёт сумму
+MENU_TEXTS = {b.text for row in main_menu().keyboard for b in row}
+NOT_MENU = ~F.text.in_(MENU_TEXTS)
+from states import Checkin, Obligations, Salary
 
 logger = logging.getLogger(__name__)
 router = Router()
 db = None
 
-# Разобранные выписки, для которых пользователь ещё не выбрал карту
-_pending: dict[int, object] = {}
-
-MONTHS_NOM = ["", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-              "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
-REFI_RATE = 0.20   # ориентир ставки рефинансирования, годовых
+CHECKIN_EVERY_DAYS = 4
+MONTHS_GEN = ["", "янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
 
 
 def bind_db(database):
@@ -39,237 +39,389 @@ def _rub(x: float) -> str:
     return f"{x:,.0f}".replace(",", " ") + " ₽"
 
 
-def _month_bounds(d: date) -> tuple[str, str]:
-    start = d.replace(day=1)
-    end = (start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-    return start.isoformat(), end.isoformat()
+def _d(d: date) -> str:
+    return f"{d.day} {MONTHS_GEN[d.month]}"
 
 
-def _card_stats(txns: list) -> dict:
-    s = {"purchase": 0.0, "transfer": 0.0, "fee": 0.0, "interest": 0.0, "topup": 0.0}
-    for t in txns:
-        s[t["kind"]] += abs(t["amount"])
-    s["taken"] = s["purchase"] + s["transfer"] + s["fee"]
-    s["net"] = s["taken"] + s["interest"] - s["topup"]   # прирост долга
-    return s
-
-
-# ── Приём выписок ─────────────────────────────────────────────────────────────
-
-@router.message(F.document)
-async def statement_received(message: Message, state: FSMContext, bot: Bot):
-    doc = message.document
-    if not (doc.file_name or "").lower().endswith(".pdf") and doc.mime_type != "application/pdf":
-        await message.answer("Я понимаю только PDF-выписки Т-Банка и ОТП.")
-        return
-    await state.clear()
-    buf = io.BytesIO()
-    await bot.download(doc, destination=buf)
+def _parse_amount(text: str) -> float | None:
     try:
-        st = await asyncio.to_thread(parse_statement, buf.getvalue())
-    except Exception as e:
-        logger.exception("Ошибка разбора выписки")
-        await message.answer(f"Не смог прочитать PDF: {e}")
-        return
-    if st is None or not st.txns:
-        await message.answer(
-            "Не узнал выписку 🤔\n\nПока умею:\n"
-            "• Т-Банк — «Справка о движении средств» по кредитке\n"
-            "• ОТП — выписка по счёту кредитной карты"
-        )
-        return
+        v = float(text.replace(" ", "").replace("\xa0", "").replace("₽", "").replace(",", "."))
+        return v if v >= 0 else None
+    except ValueError:
+        return None
 
-    credit = await db.get_credit_by_bank(message.from_user.id, st.bank)
-    if credit:
-        await _import(message, credit, st)
-        return
 
-    cards = [c for c in await db.get_credits(message.from_user.id) if not c.get("bank")]
-    if not cards:
-        await message.answer(
-            f"Выписка {BANK_TITLES[st.bank]}, но в боте нет карты, к которой её привязать. "
-            "Сначала добавь карту в «💳 Кредиты и карты»."
-        )
-        return
-    _pending[message.from_user.id] = st
-    await message.answer(
-        f"📄 Выписка <b>{BANK_TITLES[st.bank]}</b>. К какой карте в боте она относится?",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"💳 {c['name']}", callback_data=f"stbind:{c['id']}")]
-            for c in cards
-        ]),
+def parse_obligation(text: str) -> tuple[str, float, int | None] | None:
+    """«Квартира 40 000 2» → ("Квартира", 40000, 2). День — необязательное последнее число 1–31."""
+    m = re.match(r"^\s*(.*?[^\d\s].*?)\s+([\d\s.,]+)$", text.strip())
+    if not m:
+        return None
+    name, tokens = m.group(1).strip(), m.group(2).split()
+    day = None
+    if len(tokens) > 1 and len(tokens[-1]) <= 2 and 1 <= int(tokens[-1]) <= 31:
+        day = int(tokens.pop())
+    amount = _parse_amount("".join(tokens))
+    if not amount:
+        return None
+    return name, amount, day
+
+
+async def _loans(user_id: int) -> list:
+    """Активные кредиты как обязательные платежи."""
+    return [
+        {"name": c["name"], "payment": calc_min_payment(c, c["debt"]), "payment_day": c["payment_day"]}
+        for c in await db.get_credits(user_id) if c["debt"] > 0.01
+    ]
+
+
+def _cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✖️ Отмена", callback_data="cf_cancel")
+    ]])
+
+
+@router.callback_query(F.data == "cf_cancel")
+async def cf_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Отменено.")
+
+
+# ── Обязательные расходы ──────────────────────────────────────────────────────
+
+OBLIGATIONS_INTRO = (
+    "📌 <b>Обязательные расходы</b>\n\n"
+    "Что ты платишь каждый месяц в любом случае? Пиши по одному в строку:\n"
+    "<code>название сумма день</code>\n\n"
+    "Например:\n"
+    "<code>Квартира 40000 2</code>\n"
+    "<code>Склад 44448 10</code>\n"
+    "<code>Связь 1900</code> — без дня, если платишь когда придётся\n\n"
+    "Платёж по кредиту не вводи — я беру его из «💳 Кредиты и карты»."
+)
+
+
+def _obligations_done_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Готово", callback_data="obl_done")
+    ]])
+
+
+async def _obligations_text(user_id: int) -> str:
+    obligations = await db.get_obligations(user_id)
+    loans = await _loans(user_id)
+    lines = ["📌 <b>Обязательные расходы в месяц</b>\n"]
+    for o in obligations:
+        when = f"{o['day']}-го" if o["day"] else "в течение месяца"
+        lines.append(f"• {o['name']} — {_rub(o['amount'])}, {when}")
+    for l in loans:
+        lines.append(f"• 🏦 {l['name']} — {_rub(l['payment'])}, {l['payment_day']}-го")
+    if not obligations and not loans:
+        lines.append("Пока пусто.")
+    total = sum(o["amount"] for o in obligations) + sum(l["payment"] for l in loans)
+    lines.append(f"\nИтого: <b>{_rub(total)}</b> в месяц")
+    return "\n".join(lines)
+
+
+def _obligations_kb(obligations: list) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=f"🗑 {o['name']}", callback_data=f"obl_del:{o['id']}")]
+            for o in obligations]
+    rows.append([InlineKeyboardButton(text="➕ Добавить обязательный расход", callback_data="obl_add")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def start_obligations_setup(message: Message, state: FSMContext):
+    await state.set_state(Obligations.add)
+    await message.answer(OBLIGATIONS_INTRO, parse_mode="HTML", reply_markup=_obligations_done_kb())
+
+
+@router.callback_query(F.data == "obl_start")
+async def obl_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await start_obligations_setup(callback.message, state)
+
+
+@router.callback_query(F.data == "obl_add")
+async def obl_add(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(Obligations.add)
+    await callback.message.answer(
+        "Напиши расход: <code>название сумма день</code>\nНапример: <code>Интернет 1000 28</code>",
+        parse_mode="HTML", reply_markup=_obligations_done_kb()
     )
 
 
-@router.callback_query(F.data.startswith("stbind:"))
-async def statement_bind(callback: CallbackQuery):
-    st = _pending.pop(callback.from_user.id, None)
-    if st is None:
-        await callback.answer("Пришли выписку ещё раз", show_alert=True)
+@router.message(Obligations.add, NOT_MENU)
+async def obl_input(message: Message, state: FSMContext):
+    parsed = parse_obligation(message.text or "")
+    if not parsed:
+        await message.answer(
+            "Не понял 🤔 Формат: <code>название сумма день</code>, например <code>Квартира 40000 2</code>",
+            parse_mode="HTML"
+        )
         return
-    credit_id = int(callback.data.split(":")[1])
-    await db.update_credit_fields(credit_id, bank=st.bank)
-    credit = await db.get_credit(credit_id)
-    await callback.message.edit_text(f"🔗 {BANK_TITLES[st.bank]} → <b>{credit['name']}</b>", parse_mode="HTML")
-    await _import(callback.message, credit, st)
+    name, amount, day = parsed
+    await db.add_obligation(message.from_user.id, name, amount, day)
+    when = f", {day}-го числа" if day else ""
+    await message.answer(
+        f"✅ {name} — {_rub(amount)}{when}\n\nЕщё? Пиши следующий или жми «Готово».",
+        reply_markup=_obligations_done_kb()
+    )
 
 
-async def _import(message: Message, credit: dict, st):
-    old_debt = credit["debt"]
-    new = await db.add_bank_txns(credit["user_id"], credit["id"], st.bank, st.txns)
+@router.callback_query(F.data == "obl_done")
+async def obl_done(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    user = await db.get_user(callback.from_user.id)
+    first_time = user.get("obligations_asked") != 1
+    await db.set_user_fields(callback.from_user.id, obligations_asked=1)
+    obligations = await db.get_obligations(callback.from_user.id)
+    await callback.message.answer(
+        await _obligations_text(callback.from_user.id),
+        parse_mode="HTML", reply_markup=_obligations_kb(obligations)
+    )
+    if first_time and not await db.get_balance_checks(callback.from_user.id, limit=1):
+        await _ask_balance(callback.message, state)
 
-    # Т-Банк пишет доступный остаток: при известном лимите это точный долг на дату
-    limit = credit.get("credit_limit")
-    if st.available is not None and limit:
-        await db.set_anchor(credit["id"], limit - st.available, st.as_of)
-    debt = await db.recompute_debt(credit["id"])
-    if st.available is not None and not limit and debt is not None:
-        limit = round(debt + st.available, 2)
-        await db.update_credit_fields(credit["id"], credit_limit=limit)
 
-    lines = [
-        f"📄 <b>{BANK_TITLES[st.bank]} → {credit['name']}</b>",
-        f"Период: {st.period or '—'}",
-        f"Операций в выписке: {len(st.txns)}, новых: <b>{len(new)}</b>",
-        "",
-    ]
-    if debt is None:
+@router.callback_query(F.data == "obl_list")
+async def obl_list(callback: CallbackQuery):
+    await callback.answer()
+    obligations = await db.get_obligations(callback.from_user.id)
+    await callback.message.answer(
+        await _obligations_text(callback.from_user.id),
+        parse_mode="HTML", reply_markup=_obligations_kb(obligations)
+    )
+
+
+@router.callback_query(F.data.startswith("obl_del:"))
+async def obl_delete(callback: CallbackQuery):
+    await db.delete_obligation(callback.from_user.id, int(callback.data.split(":")[1]))
+    await callback.answer("Удалено")
+    obligations = await db.get_obligations(callback.from_user.id)
+    await callback.message.edit_text(
+        await _obligations_text(callback.from_user.id),
+        parse_mode="HTML", reply_markup=_obligations_kb(obligations)
+    )
+
+
+# ── Зарплата ──────────────────────────────────────────────────────────────────
+
+@router.message(F.text == "💰 Пришла зарплата")
+async def salary_start(message: Message, state: FSMContext):
+    await state.set_state(Salary.amount)
+    await message.answer("💰 Сколько пришло? (₽)", reply_markup=_cancel_kb())
+
+
+@router.message(Salary.amount, NOT_MENU)
+async def salary_amount(message: Message, state: FSMContext):
+    amount = _parse_amount(message.text or "")
+    if not amount:
+        await message.answer("Введи сумму, например: <code>85000</code>", parse_mode="HTML")
+        return
+    await state.clear()
+    await db.add_income(message.from_user.id, amount)
+    await message.answer(
+        f"✅ Записал зарплату: <b>+{_rub(amount)}</b>",
+        parse_mode="HTML", reply_markup=main_menu()
+    )
+    await message.answer(
+        "Сверим остаток, чтобы я пересчитал, на сколько хватит денег?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 Сверить остаток", callback_data="checkin")
+        ]])
+    )
+
+
+# ── Проверка остатка раз в 4 дня ──────────────────────────────────────────────
+
+async def _ask_balance(message: Message, state: FSMContext):
+    await state.set_state(Checkin.balance)
+    await message.answer(
+        "💳 Сколько сейчас денег на руках? Сложи все карты и наличные (₽):",
+        reply_markup=_cancel_kb()
+    )
+
+
+@router.callback_query(F.data == "checkin")
+async def checkin_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _ask_balance(callback.message, state)
+
+
+@router.message(Checkin.balance, NOT_MENU)
+async def checkin_balance(message: Message, state: FSMContext):
+    balance = _parse_amount(message.text or "")
+    if balance is None:
+        await message.answer("Введи сумму, например: <code>52000</code>", parse_mode="HTML")
+        return
+    await state.clear()
+    user_id = message.from_user.id
+    await db.add_balance_check(user_id, balance)
+    await db.set_user_fields(user_id, checkin_asked_at=None)
+    await message.answer(await verdict_text(user_id), parse_mode="HTML", reply_markup=main_menu())
+
+
+async def verdict_text(user_id: int) -> str:
+    checks = await db.get_balance_checks(user_id)
+    obligations = await db.get_obligations(user_id)
+    loans = await _loans(user_id)
+    oldest = checks[-1]["date"] if checks else datetime.now().isoformat()
+    incomes = await db.get_incomes(user_id, since=oldest)
+    check_day = datetime.fromisoformat(checks[0]["date"]).date()
+    r = analyze(checks, incomes, obligations, loans, check_day)
+
+    pace, allowed = r["pace"], max(r["allowed"], 0.0)
+    lines = []
+    if r["level"] == "red_mandatory":
         lines.append(
-            "⚠️ Не знаю точный долг на дату, от которой считать. "
-            "Нажми «✏️ Обновить остатки» и введи «Весь долг» из приложения банка — "
-            "дальше буду считать сам по выпискам."
+            f"🔴 <b>Денег не хватает даже на обязательные платежи.</b>\n"
+            f"На 30 дней нужно {_rub(r['mandatory_next'])}, на руках {_rub(r['balance'])} — "
+            f"не хватает <b>{_rub(-r['free'])}</b>."
+        )
+        if r["run_out"]:
+            what = f" — на «{r['run_out_payment'][0]}»" if r["run_out_payment"] else ""
+            lines.append(f"Деньги кончатся <b>{_d(r['run_out'])}</b>{what}. Нужен доход до этой даты.")
+    elif r["level"] == "first":
+        lines.append(
+            f"📝 Записал: на руках <b>{_rub(r['balance'])}</b>.\n"
+            f"Чтобы продержаться 30 дней, можно тратить до <b>{_rub(allowed)}/день</b>.\n"
+            f"Темп трат посчитаю на следующей проверке — через {CHECKIN_EVERY_DAYS} дня."
+        )
+    elif r["level"] == "red":
+        what = f" — не хватит на «{r['run_out_payment'][0]}»" if r["run_out_payment"] else ""
+        lines.append(
+            f"🔴 <b>Тратишь быстрее, чем кончаются деньги.</b>\n"
+            f"Темп ~<b>{_rub(pace)}/день</b>: деньги закончатся <b>{_d(r['run_out'])}</b>{what}.\n"
+            f"Чтобы продержаться 30 дней — не больше <b>{_rub(allowed)}/день</b>."
+        )
+    elif r["level"] == "yellow":
+        lines.append(
+            f"🟡 <b>На грани.</b>\n"
+            f"Тратишь ~<b>{_rub(pace)}/день</b> при допустимых {_rub(allowed)}/день."
         )
     else:
-        diff = debt - old_debt
-        sign = "+" if diff > 0 else ""
-        lines.append(f"💰 Долг: <b>{_rub(debt)}</b>  (было в боте {_rub(old_debt)}, {sign}{_rub(diff)})")
-        if limit:
-            lines.append(f"📏 Лимит {_rub(limit)}, свободно ≈ {_rub(max(0.0, limit - debt))}")
+        lines.append(
+            f"🟢 <b>Пока норм.</b>\n"
+            f"Тратишь ~<b>{_rub(max(pace, 0))}/день</b>, можно до {_rub(allowed)}/день."
+        )
 
-    if new:
-        recent = [t for t in new if t.date >= (date.today() - timedelta(days=30)).isoformat()]
-        if recent:
-            s = _card_stats([{"kind": t.kind, "amount": t.amount} for t in recent])
-            lines += [
-                "",
-                "<b>За последние 30 дней:</b>",
-                f"  🛒 покупки: {_rub(s['purchase'])}",
-                f"  💸 вывод переводом: {_rub(s['transfer'])}" if s["transfer"] else None,
-                f"  🔥 проценты: {_rub(s['interest'])}",
-                f"  ✅ внесено: {_rub(s['topup'])}",
-                f"  📈 долг {'вырос' if s['net'] > 0 else 'уменьшился'} на {_rub(abs(s['net']))}",
-            ]
-    lines += ["", await _sync_sheet(credit["id"], st.bank)]
-    await message.answer("\n".join(l for l in lines if l is not None), parse_mode="HTML")
+    if r["level"] in ("yellow", "green"):
+        lines.append(
+            f"⏳ Денег хватит до <b>{_d(r['run_out'])}</b>" if r["run_out"]
+            else "⏳ Денег хватит больше чем на полгода"
+        )
+    if r["pace_avg"] is not None and pace is not None:
+        lines.append(f"📊 В среднем за последние недели: {_rub(max(r['pace_avg'], 0))}/день")
+    if r["unexplained_growth"]:
+        lines.append("❓ Денег стало больше, чем пришло зарплаты. Если был другой доход — внеси его через «💰 Пришла зарплата».")
+    if r["income_period"]:
+        lines.append(f"💰 Зарплата за период: +{_rub(r['income_period'])}")
 
-
-async def _sync_sheet(credit_id: int, bank: str) -> str:
-    """Дописывает в cashflow операции, которых там ещё нет (новее последней даты по этому счёту)."""
-    pending = await db.get_pending_sheet_txns(credit_id)
-    if not pending:
-        return "📊 Таблица: новых строк нет"
-    if not sheets.is_configured():
-        return f"📊 Таблица не подключена — {len(pending)} операций ждут записи"
-    try:
-        last = (await sheets.last_dates_by_account()).get(SHEET_ACCOUNTS[bank])
-        cutoff = last.isoformat() if last else ""
-        skip = [t["id"] for t in pending if t["op_date"] <= cutoff]
-        write = [t for t in pending if t["op_date"] > cutoff]
-        rows = sheet_rows(bank, [
-            Txn(t["op_date"], t["op_time"], t["amount"], t["kind"], t["description"]) for t in write
-        ])
-        await sheets.append_rows(rows)
-        await db.set_sheet_status([t["id"] for t in write], "synced")
-        await db.set_sheet_status(skip, "skipped")
-        return f"📊 Таблица: добавлено строк — <b>{len(rows)}</b>" + (
-            f" (с {last.strftime('%d.%m')} — то, что уже было, не трогал)" if last else "")
-    except Exception as e:
-        logger.exception("Ошибка записи в таблицу")
-        return f"📊 Не смог записать в таблицу: {e}"
+    lines.append(
+        f"\n💳 На руках {_rub(r['balance'])}, из них на обязательные 30 дней — {_rub(r['mandatory_next'])}"
+    )
+    if r["upcoming"]:
+        lines.append("📅 Ближайшие платежи:")
+        lines += [f"   {_d(d)} — {name}, {_rub(a)}" for d, name, a in r["upcoming"][:4]]
+    elif not obligations and not loans:
+        lines.append("📌 Обязательных расходов нет — добавь их в «💸 Кешфлоу», иначе прогноз будет слишком оптимистичным.")
+    return "\n".join(lines)
 
 
-# ── Кешфлоу ───────────────────────────────────────────────────────────────────
+async def send_checkin_reminders(bot: Bot):
+    """Раз в день: если остаток не сверяли 4+ дня — просим. Повторяем не чаще раза в 2 дня."""
+    now = datetime.now()
+    for u in await db.get_all_users():
+        checks = await db.get_balance_checks(u["user_id"], limit=1)
+        if u.get("obligations_asked") != 1 and not checks:
+            continue
+        if checks and now - datetime.fromisoformat(checks[0]["date"]) < timedelta(days=CHECKIN_EVERY_DAYS):
+            continue
+        asked = u.get("checkin_asked_at")
+        if asked and now - datetime.fromisoformat(asked) < timedelta(days=2):
+            continue
+        try:
+            await bot.send_message(
+                u["user_id"],
+                "🔄 <b>Проверка кешфлоу</b>\n\nСколько сейчас денег на руках? "
+                "Скажу, успеваешь ли до следующих платежей.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="💳 Ввести остаток", callback_data="checkin")
+                ]])
+            )
+            await db.set_user_fields(u["user_id"], checkin_asked_at=now.isoformat(timespec="minutes"))
+        except Exception as e:
+            logger.error(f"Checkin reminder error user={u['user_id']}: {e}")
+
+
+async def send_obligations_onboarding(bot: Bot):
+    """Один раз: спрашиваем про обязательные расходы у тех, у кого есть кредиты в боте."""
+    for u in await db.get_all_users():
+        if u.get("obligations_asked"):
+            continue
+        if not await db.get_credits(u["user_id"], active_only=False):
+            continue
+        try:
+            await bot.send_message(
+                u["user_id"],
+                "👋 Бот теперь следит за кешфлоу: обязательные расходы, зарплата и раз в "
+                f"{CHECKIN_EVERY_DAYS} дня — успеваешь ли до следующих платежей.\n\n"
+                "Для начала расскажи, какие у тебя обязательные расходы каждый месяц.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="📌 Заполнить", callback_data="obl_start")
+                ]])
+            )
+            await db.set_user_fields(u["user_id"], obligations_asked=2)   # спросили, но ещё не заполнил
+        except Exception as e:
+            logger.error(f"Obligations onboarding error user={u['user_id']}: {e}")
+
+
+# ── Экран «Кешфлоу» ───────────────────────────────────────────────────────────
+
+def _cashflow_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сверить остаток", callback_data="checkin")],
+        [InlineKeyboardButton(text="📌 Обязательные расходы", callback_data="obl_list")],
+        [InlineKeyboardButton(text="➕ Добавить обязательный расход", callback_data="obl_add")],
+    ])
+
 
 @router.message(F.text == "💸 Кешфлоу")
 async def cashflow_screen(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(await build_cashflow_text(message.from_user.id), parse_mode="HTML")
+    user_id = message.from_user.id
+    user = await db.get_user(user_id)
+    if user and user.get("obligations_asked") != 1:
+        await start_obligations_setup(message, state)
+        return
 
+    checks = await db.get_balance_checks(user_id)
+    if not checks:
+        await message.answer("Ещё не было ни одной проверки остатка.", reply_markup=_cashflow_kb())
+        return
 
-async def build_cashflow_text(user_id: int) -> str:
-    today = date.today()
-    m_from, m_to = _month_bounds(today)
-    lines = [f"💸 <b>Кешфлоу — {MONTHS_NOM[today.month]} {today.year}</b>", ""]
+    last = checks[0]
+    last_dt = datetime.fromisoformat(last["date"])
+    days_ago = (datetime.now() - last_dt).days
+    lines = [f"💸 <b>Кешфлоу</b> — последняя проверка {_d(last_dt.date())}"
+             + (f" ({days_ago} дн. назад)" if days_ago else " (сегодня)"), ""]
+    lines.append(await verdict_text(user_id))
 
-    # Деньги по таблице
-    if sheets.is_configured():
-        try:
-            t = await sheets.month_totals(today.year, today.month)
-            lines += [
-                "<b>По таблице:</b>",
-                f"  ⬆️ доходы: {_rub(t['income'])}",
-                f"  ⬇️ расходы: {_rub(t['expense'])}",
-                f"  {'🟢' if t['income'] >= t['expense'] else '🔴'} сальдо: {_rub(t['income'] - t['expense'])}",
-            ]
-            top = sorted(t["by_cat"].items(), key=lambda x: -x[1])[:4]
-            if top:
-                lines.append("  крупнее всего: " + ", ".join(f"{c} {_rub(v)}" for c, v in top))
-            lines.append("")
-        except Exception as e:
-            logger.exception("Ошибка чтения таблицы")
-            lines += [f"📊 Таблица недоступна: {e}", ""]
+    if days_ago >= 1:
+        # Оценка остатка на сегодня: зарплата и обязательные платежи с момента проверки + темп трат
+        incomes = await db.get_incomes(user_id, since=last["date"])
+        obligations = await db.get_obligations(user_id)
+        loans = await _loans(user_id)
+        r = analyze(checks, incomes, obligations, loans, last_dt.date())
+        estimate = (last["balance"] + sum(i["amount"] for i in incomes)
+                    - mandatory_between(last_dt.date(), date.today(), obligations, loans)
+                    - max(r["pace"] or 0, 0) * days_ago)
+        lines.append(f"\n≈ Сейчас на руках примерно <b>{_rub(estimate)}</b> — сверь остаток для точного прогноза.")
 
-    cards = [c for c in await db.get_credits(user_id) if c.get("bank")]
-    if not cards:
-        lines.append("Пришли PDF-выписки Т-Банка и ОТП — покажу, что происходит с кредитками.")
-        return "\n".join(lines)
-
-    month_txns = await db.get_txns(user_id, m_from, m_to)
-    q_start = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
-    for _ in range(2):
-        q_start = (q_start - timedelta(days=1)).replace(day=1)
-    q_txns = await db.get_txns(user_id, q_start.isoformat(), (today.replace(day=1) - timedelta(days=1)).isoformat())
-
-    last_txn = max((t["op_date"] for t in month_txns), default=None)
-    lines.append("<b>Кредитки в этом месяце</b>" + (
-        f" <i>(выписки по {last_txn[8:10]}.{last_txn[5:7]})</i>" if last_txn else " <i>(нет выписок)</i>"))
-    total_net = total_interest_avg = total_debt = total_free = q_net = 0.0
-    for c in cards:
-        s = _card_stats([t for t in month_txns if t["credit_id"] == c["id"]])
-        q = _card_stats([t for t in q_txns if t["credit_id"] == c["id"]])
-        interest_avg = q["interest"] / 3
-        total_net += s["net"]
-        q_net += q["net"]
-        total_interest_avg += interest_avg
-        total_debt += c["debt"]
-        limit = c.get("credit_limit")
-        free = max(0.0, limit - c["debt"]) if limit else 0.0
-        total_free += free
-        rate = interest_avg * 12 / c["debt"] * 100 if c["debt"] > 0 else 0
-        lines += [
-            f"💳 <b>{c['name']}</b> — долг {_rub(c['debt'])}" + (f" из {_rub(limit)}" if limit else ""),
-            f"   взято {_rub(s['taken'])}, внесено {_rub(s['topup'])}, проценты {_rub(s['interest'])}",
-            f"   долг за месяц: {'+' if s['net'] >= 0 else '−'}{_rub(abs(s['net']))}",
-            f"   проценты в среднем {_rub(interest_avg)}/мес (≈ {rate:.0f}% годовых)" if interest_avg else None,
-            f"   📅 платёж {_next_payment_date(c['payment_day'])}, минималка ≈ {_rub(calc_min_payment(c, c['debt']))}",
-        ]
-
-    lines += [
-        "",
-        f"📈 <b>Кредитки за месяц: {'+' if total_net >= 0 else '−'}{_rub(abs(total_net))}</b> долга",
-        f"🔥 Проценты: ≈ {_rub(total_interest_avg)}/мес — {_rub(total_interest_avg * 12)} в год",
-    ]
-    avg_growth = q_net / 3
-    if total_free and avg_growth > 0:
-        lines.append(
-            f"⏳ Свободного лимита {_rub(total_free)}. При темпе последних 3 мес "
-            f"(+{_rub(avg_growth)}/мес) его хватит примерно на <b>{total_free / avg_growth:.1f} мес.</b>"
-        )
-    if total_debt > 0 and total_interest_avg > 0:
-        refi = total_debt * REFI_RATE / 12
-        lines.append(
-            f"🔄 Рефинанс всего долга под {REFI_RATE:.0%}: проценты ≈ {_rub(refi)}/мес вместо "
-            f"{_rub(total_interest_avg)} — экономия {_rub(total_interest_avg - refi)}/мес"
-        )
-    return "\n".join(l for l in lines if l is not None)
+    month_start = date.today().replace(day=1).isoformat()
+    month_income = sum(i["amount"] for i in await db.get_incomes(user_id, since=month_start))
+    if month_income:
+        lines.append(f"💰 Зарплата в этом месяце: +{_rub(month_income)}")
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=_cashflow_kb())

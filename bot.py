@@ -20,7 +20,7 @@ from keyboards import (
     calendar_kb, plan_view_kb, plan_edit_kb, plan_edit_item_kb, payday_has_p2_kb,
     cancel_kb, wow_kb, early_credits_kb, early_type_kb, early_calc_result_kb
 )
-from datetime import date as date_cls
+from datetime import date as date_cls, datetime
 from calculator import recalculate_schedule, format_status, calc_interest, calc_min_payment, calc_min_only_schedule, generate_plan, calc_early_payment_savings, calc_credit_early_payment
 
 logging.basicConfig(level=logging.INFO)
@@ -410,11 +410,13 @@ async def add_credit_rate(message: Message, state: FSMContext):
             await state.update_data(rate=0.0, monthly_payment=val)
             await message.answer(
                 f"✅ Платёж: <b>{val:,.0f} ₽/мес</b>\n\n"
-                "Шаг 4: День списания платежа по договору (1–31)\n"
-                "Например: <code>20</code> или <code>25</code>",
+                "Шаг 4: Ставка по кредиту <b>в год</b> (%)\n"
+                "Например: <code>21.9</code>. Беспроцентная рассрочка — <code>0</code>",
                 parse_mode="HTML",
                 reply_markup=cancel_kb("credits_section")
             )
+            await state.set_state(AddCredit.loan_rate)
+            return
         await state.set_state(AddCredit.payment_day)
     except ValueError:
         data = await state.get_data()
@@ -422,6 +424,26 @@ async def add_credit_rate(message: Message, state: FSMContext):
             await message.answer("Введи годовую ставку, например: <code>39.9</code>", parse_mode="HTML")
         else:
             await message.answer("Введи сумму платежа, например: <code>15000</code>", parse_mode="HTML")
+
+
+@router.message(AddCredit.loan_rate)
+async def add_credit_loan_rate(message: Message, state: FSMContext):
+    try:
+        val = float(message.text.replace(",", ".").replace("%", "").replace(" ", "").strip())
+        if not 0 <= val <= 600:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введи годовую ставку, например: <code>21.9</code>", parse_mode="HTML")
+        return
+    await state.update_data(rate=val / 12 / 100)
+    await message.answer(
+        f"✅ Ставка: <b>{val:.1f}% годовых</b>\n\n"
+        "Шаг 5: День списания платежа по договору (1–31)\n"
+        "Например: <code>20</code> или <code>25</code>",
+        parse_mode="HTML",
+        reply_markup=cancel_kb("credits_section")
+    )
+    await state.set_state(AddCredit.payment_day)
 
 
 @router.message(AddCredit.payment_day)
@@ -457,7 +479,7 @@ async def add_credit_day(message: Message, state: FSMContext):
                 user_id=message.from_user.id,
                 name=data["name"],
                 debt=data["debt"],
-                rate_month=0.0,
+                rate_month=data.get("rate", 0.0),
                 payment_day=day,
                 min_type="fixed",
                 min_multiplier=2.0,
@@ -471,6 +493,7 @@ async def add_credit_day(message: Message, state: FSMContext):
                 f"🏦 {data['name']}\n"
                 f"💰 Долг: {data['debt']:,.0f} ₽\n"
                 f"📆 Платёж: {data['monthly_payment']:,.0f} ₽/мес\n"
+                f"📈 Ставка: {data.get('rate', 0.0)*12*100:.1f}% годовых\n"
                 f"📅 День списания: {day}-е\n\n"
                 f"💡 Приоритет и минималку можно настроить в карточке кредита → ✏️ Редактировать",
                 parse_mode="HTML",
@@ -811,12 +834,17 @@ async def _record_and_show_debt_check(
 ):
     """Записывает платёж в БД и показывает сообщение с проверкой остатка."""
     c = await db.get_credit(credit_id)
-    # Проценты здесь не начисляем: банк начисляет их раз в месяц, и они приходят
-    # из выписок. Иначе при двух платежах в месяц проценты считаются дважды.
-    new_debt = max(0.0, c["debt"] - payment)
+    # Проценты — только за дни с прошлого платежа: при двух платежах в месяц
+    # месячные проценты не должны начисляться дважды
+    last = await db.get_last_payment_date(credit_id)
+    since = (datetime.strptime(last, "%d.%m.%Y") if last
+             else datetime.strptime(c["created_at"][:10], "%Y-%m-%d"))
+    days = min(max((datetime.now() - since).days, 0), 62)
+    interest = calc_interest(c, c["debt"]) * days / 30
+    new_debt = max(0.0, c["debt"] + interest - payment)
 
     await db.update_credit_debt(credit_id, new_debt, payment)
-    await db.record_payment(credit_id, user_id, payment, 0.0, new_debt)
+    await db.record_payment(credit_id, user_id, payment, interest, new_debt)
 
     if new_debt < 0.01:
         await send_fn(
@@ -833,7 +861,7 @@ async def _record_and_show_debt_check(
     await send_fn(
         f"✅ <b>Платёж записан!</b>\n\n"
         f"💳 <b>{c['name']}</b>\n"
-        f"💸 Внесено: <b>{payment:,.0f} ₽</b>\n\n"
+        f"💸 Внесено: <b>{payment:,.0f} ₽</b>  (из них % ≈ {interest:,.0f} ₽)\n\n"
         f"По моим расчётам, сейчас осталось: <b>{new_debt:,.0f} ₽</b>\n\n"
         f"Это верно? Открой приложение банка и проверь.",
         parse_mode="HTML",
@@ -2236,10 +2264,7 @@ async def ob_rem_more(callback: CallbackQuery, state: FSMContext):
 
 # ─── Проверка выписки по кредитной карте ──────────────────────────────────────
 
-STMT_MOVED = (
-    "Проценты теперь берутся из выписок 📄\n\n"
-    "Просто перешли сюда PDF-выписку из банка — я сам посчитаю долг и проценты."
-)
+STMT_MOVED = "Эта проверка больше не нужна — проценты по кредиту бот считает сам." 
 
 
 @router.callback_query(F.data.startswith("stmt_enter:"))
@@ -3292,7 +3317,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     cashflow.bind_db(db)
-    dp.include_router(cashflow.router)   # раньше основного: PDF не должны ловить FSM-хендлеры
+    dp.include_router(cashflow.router)   # раньше основного: кнопки кешфлоу работают из любого состояния
     dp.include_router(router)
     await start_scheduler(bot, db)
     logger.info("Бот запущен")

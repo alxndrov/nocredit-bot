@@ -7,10 +7,10 @@ from aiogram.types import (
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📊 Статус"),           KeyboardButton(text="💸 Кешфлоу")],
-            [KeyboardButton(text="✅ Внести платёж"),    KeyboardButton(text="💳 Кредиты и карты")],
-            [KeyboardButton(text="📅 Календарь"),        KeyboardButton(text="📋 История")],
-            [KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="💸 Кешфлоу"),          KeyboardButton(text="💰 Пришла зарплата")],
+            [KeyboardButton(text="📊 Статус"),           KeyboardButton(text="✅ Внести платёж")],
+            [KeyboardButton(text="💳 Кредиты и карты"),  KeyboardButton(text="📅 Календарь")],
+            [KeyboardButton(text="📋 История"),           KeyboardButton(text="⚙️ Настройки")],
         ],
         resize_keyboard=True
     )

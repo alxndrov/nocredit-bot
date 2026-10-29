@@ -6,6 +6,7 @@ class AddCredit(StatesGroup):
     name         = State()
     debt         = State()
     rate         = State()   # для карты: годовых; для кредита: ежемесячный платёж
+    loan_rate    = State()   # только для кредита: ставка годовых
     payment_day  = State()
     min_type     = State()   # только для карты
     min_value    = State()   # только для карты
@@ -80,3 +81,15 @@ class EditPlan(StatesGroup):
 
 class SyncBalances(StatesGroup):
     balance = State()
+
+
+class Obligations(StatesGroup):
+    add = State()     # «название сумма день»
+
+
+class Salary(StatesGroup):
+    amount = State()
+
+
+class Checkin(StatesGroup):
+    balance = State()  # сколько денег на руках

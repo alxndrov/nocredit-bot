@@ -50,12 +50,9 @@ class Database:
                 "UPDATE credits SET min_type='percent' WHERE credit_type='card' AND min_type='formula' AND min_multiplier >= 3",
                 # Тип записи: 'payment' (платёж) или 'expense' (расход с карты)
                 "ALTER TABLE payments ADD COLUMN type TEXT NOT NULL DEFAULT 'payment'",
-                # Выписки: банк карты, лимит и «якорь» — точный долг на дату,
-                # от которого долг считается по операциям из выписок
-                "ALTER TABLE credits ADD COLUMN bank TEXT DEFAULT NULL",
-                "ALTER TABLE credits ADD COLUMN credit_limit REAL DEFAULT NULL",
-                "ALTER TABLE credits ADD COLUMN anchor_debt REAL DEFAULT NULL",
-                "ALTER TABLE credits ADD COLUMN anchor_date TEXT DEFAULT NULL",
+                # Кешфлоу: разовый опрос обязательных расходов и проверка остатка раз в 4 дня
+                "ALTER TABLE users ADD COLUMN obligations_asked INTEGER DEFAULT 0",
+                "ALTER TABLE users ADD COLUMN checkin_asked_at TEXT DEFAULT NULL",
             ]:
                 try:
                     await db.execute(migration)
@@ -131,24 +128,33 @@ class Database:
                     debt_after  REAL    NOT NULL
                 )
             """)
-            # Операции из банковских выписок.
-            # amount: + пополнение карты, − списание с карты.
-            # sheet_status: pending / synced / skipped (уже было в таблице или не пишется)
+            # Обязательные ежемесячные расходы (квартира, склад, связь…)
             await db.execute("""
-                CREATE TABLE IF NOT EXISTS bank_txns (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id      INTEGER NOT NULL,
-                    credit_id    INTEGER NOT NULL,
-                    bank         TEXT    NOT NULL,
-                    uid          TEXT    NOT NULL,
-                    op_date      TEXT    NOT NULL,
-                    op_time      TEXT    NOT NULL DEFAULT '',
-                    amount       REAL    NOT NULL,
-                    kind         TEXT    NOT NULL,
-                    description  TEXT    NOT NULL,
-                    sheet_status TEXT    NOT NULL DEFAULT 'pending',
-                    created_at   TEXT    DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE (user_id, uid)
+                CREATE TABLE IF NOT EXISTS obligations (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id   INTEGER NOT NULL,
+                    name      TEXT    NOT NULL,
+                    amount    REAL    NOT NULL,
+                    day       INTEGER DEFAULT NULL,
+                    is_active INTEGER DEFAULT 1
+                )
+            """)
+            # Поступления зарплаты (нерегулярные, сумма каждый раз своя)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS incomes (
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    date    TEXT    NOT NULL,
+                    amount  REAL    NOT NULL
+                )
+            """)
+            # Сколько денег было на руках в момент проверки
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS balance_checks (
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    date    TEXT    NOT NULL,
+                    balance REAL    NOT NULL
                 )
             """)
             # Перезапись бюджета на конкретный месяц
@@ -302,101 +308,89 @@ class Database:
     async def update_credit_fields(self, credit_id: int, **fields):
         if not fields:
             return
-        # Долг, введённый вручную, — это точный остаток из банка: делаем его якорем
-        if "debt" in fields and "anchor_debt" not in fields:
-            fields["anchor_debt"] = fields["debt"]
-            fields["anchor_date"] = datetime.now().strftime("%Y-%m-%d")
         parts = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [credit_id]
         async with aiosqlite.connect(self.path) as db:
             await db.execute(f"UPDATE credits SET {parts} WHERE id = ?", values)
             await db.commit()
 
-    # ── Выписки ───────────────────────────────────────────────────────────────
-
-    async def get_credit_by_bank(self, user_id: int, bank: str) -> dict | None:
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM credits WHERE user_id = ? AND bank = ? AND is_active = 1",
-                (user_id, bank)
-            ) as cur:
-                row = await cur.fetchone()
-                return dict(row) if row else None
-
-    async def add_bank_txns(self, user_id: int, credit_id: int, bank: str, txns: list) -> list:
-        """Сохраняет операции, пропуская уже известные. Возвращает только новые."""
-        new = []
-        async with aiosqlite.connect(self.path) as db:
-            for t in txns:
-                cur = await db.execute(
-                    """INSERT OR IGNORE INTO bank_txns
-                       (user_id, credit_id, bank, uid, op_date, op_time, amount, kind, description)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (user_id, credit_id, bank, t.uid, t.date, t.time, t.amount, t.kind, t.description)
-                )
-                if cur.rowcount:
-                    new.append(t)
-            await db.commit()
-        return new
-
-    async def set_anchor(self, credit_id: int, debt: float, anchor_date: str):
-        async with aiosqlite.connect(self.path) as db:
-            await db.execute(
-                "UPDATE credits SET anchor_debt = ?, anchor_date = ? WHERE id = ?",
-                (debt, anchor_date, credit_id)
-            )
-            await db.commit()
-
-    async def recompute_debt(self, credit_id: int) -> float | None:
-        """Долг = якорь − операции из выписок после даты якоря.
-        Без якоря долг не трогаем и возвращаем None."""
+    async def get_last_payment_date(self, credit_id: int) -> str | None:
+        """Дата последнего платежа (ДД.ММ.ГГГГ) или None."""
         async with aiosqlite.connect(self.path) as db:
             async with db.execute(
-                "SELECT anchor_debt, anchor_date FROM credits WHERE id = ?", (credit_id,)
-            ) as cur:
-                row = await cur.fetchone()
-            if not row or row[0] is None:
-                return None
-            anchor_debt, anchor_date = row
-            async with db.execute(
-                "SELECT COALESCE(SUM(amount), 0) FROM bank_txns WHERE credit_id = ? AND op_date > ?",
-                (credit_id, anchor_date)
-            ) as cur:
-                moved = (await cur.fetchone())[0]
-            debt = max(0.0, anchor_debt - moved)
-            await db.execute("UPDATE credits SET debt = ? WHERE id = ?", (debt, credit_id))
-            await db.commit()
-            return debt
-
-    async def get_txns(self, user_id: int, date_from: str, date_to: str = "9999-12-31") -> list:
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                """SELECT * FROM bank_txns WHERE user_id = ? AND op_date >= ? AND op_date <= ?
-                   ORDER BY op_date, op_time""",
-                (user_id, date_from, date_to)
-            ) as cur:
-                return [dict(r) for r in await cur.fetchall()]
-
-    async def get_pending_sheet_txns(self, credit_id: int) -> list:
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM bank_txns WHERE credit_id = ? AND sheet_status = 'pending' ORDER BY op_date, op_time",
+                "SELECT date FROM payments WHERE credit_id = ? AND type = 'payment' ORDER BY id DESC LIMIT 1",
                 (credit_id,)
             ) as cur:
+                row = await cur.fetchone()
+                return row[0] if row else None
+
+    # ── Кешфлоу ───────────────────────────────────────────────────────────────
+
+    async def set_user_fields(self, user_id: int, **fields):
+        parts = ", ".join(f"{k} = ?" for k in fields)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(f"UPDATE users SET {parts} WHERE user_id = ?", [*fields.values(), user_id])
+            await db.commit()
+
+    async def get_obligations(self, user_id: int) -> list:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM obligations WHERE user_id = ? AND is_active = 1 ORDER BY COALESCE(day, 99), id",
+                (user_id,)
+            ) as cur:
                 return [dict(r) for r in await cur.fetchall()]
 
-    async def set_sheet_status(self, txn_ids: list, status: str):
-        if not txn_ids:
-            return
+    async def add_obligation(self, user_id: int, name: str, amount: float, day: int | None):
         async with aiosqlite.connect(self.path) as db:
-            await db.executemany(
-                "UPDATE bank_txns SET sheet_status = ? WHERE id = ?",
-                [(status, i) for i in txn_ids]
+            await db.execute(
+                "INSERT INTO obligations (user_id, name, amount, day) VALUES (?, ?, ?, ?)",
+                (user_id, name, amount, day)
             )
             await db.commit()
+
+    async def delete_obligation(self, user_id: int, obligation_id: int):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE obligations SET is_active = 0 WHERE id = ? AND user_id = ?",
+                (obligation_id, user_id)
+            )
+            await db.commit()
+
+    async def add_income(self, user_id: int, amount: float):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO incomes (user_id, date, amount) VALUES (?, ?, ?)",
+                (user_id, datetime.now().isoformat(timespec="minutes"), amount)
+            )
+            await db.commit()
+
+    async def get_incomes(self, user_id: int, since: str) -> list:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM incomes WHERE user_id = ? AND date > ? ORDER BY date",
+                (user_id, since)
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def add_balance_check(self, user_id: int, balance: float):
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT INTO balance_checks (user_id, date, balance) VALUES (?, ?, ?)",
+                (user_id, datetime.now().isoformat(timespec="minutes"), balance)
+            )
+            await db.commit()
+
+    async def get_balance_checks(self, user_id: int, limit: int = 10) -> list:
+        """Последние проверки остатка, от новых к старым."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM balance_checks WHERE user_id = ? ORDER BY date DESC, id DESC LIMIT ?",
+                (user_id, limit)
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
 
     async def delete_credit(self, credit_id: int):
         async with aiosqlite.connect(self.path) as db:

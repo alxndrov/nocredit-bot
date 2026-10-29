@@ -6,6 +6,9 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
+
+from cashflow import send_checkin_reminders, send_obligations_onboarding
 
 logger = logging.getLogger(__name__)
 
@@ -195,31 +198,6 @@ async def send_monthly_summary(bot: Bot, db):
             logger.error(f"Ошибка monthly summary user={user_id}: {e}")
 
 
-async def send_weekly_sync_reminder(bot: Bot, db):
-    """Каждый вторник в 9:00: напоминание прислать выписки."""
-    users = await db.get_all_users()
-    for u in users:
-        user_id = u["user_id"]
-        credits = await db.get_credits(user_id)
-        if not credits:
-            continue
-        sync_kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✏️ Обновить остатки", callback_data="start_sync_cb")
-        ]])
-        try:
-            await bot.send_message(
-                user_id,
-                "📄 <b>Пора прислать выписки</b>\n\n"
-                "Перешли сюда PDF-выписки по кредиткам из Т-Банка и ОТП — "
-                "обновлю долги, проценты и допишу операции в таблицу.\n\n"
-                "Для ОТП раз в месяц сверь «Весь долг» из приложения — кнопка ниже.",
-                parse_mode="HTML",
-                reply_markup=sync_kb
-            )
-        except Exception as e:
-            logger.error(f"Weekly sync reminder error user={user_id}: {e}")
-
-
 async def start_scheduler(bot: Bot, db):
     scheduler.add_job(
         check_and_send_reminders,
@@ -243,11 +221,19 @@ async def start_scheduler(bot: Bot, db):
         replace_existing=True
     )
     scheduler.add_job(
-        send_weekly_sync_reminder,
-        trigger=CronTrigger(day_of_week="tue", hour=9, minute=0),
-        args=[bot, db],
-        id="weekly_sync_reminder",
+        send_checkin_reminders,
+        trigger=CronTrigger(hour=10, minute=0),
+        args=[bot],
+        id="checkin_reminder",
+        replace_existing=True
+    )
+    # Разовый вопрос про обязательные расходы — вскоре после запуска
+    scheduler.add_job(
+        send_obligations_onboarding,
+        trigger=DateTrigger(run_date=datetime.now(tz=MOSCOW_TZ) + timedelta(seconds=15)),
+        args=[bot],
+        id="obligations_onboarding",
         replace_existing=True
     )
     scheduler.start()
-    logger.info("Планировщик запущен (напоминания каждую минуту, зарплатные уведомления в 9:00, ежемесячный итог в 21:00, напоминание о выписках во вт 9:00)")
+    logger.info("Планировщик запущен (напоминания каждую минуту, зарплатные уведомления в 9:00, ежемесячный итог в 21:00, проверка кешфлоу в 10:00)")
