@@ -5,6 +5,7 @@
   • проверка раз в 4 дня: сколько денег на руках → вывод, успеваю ли до следующих платежей.
 Роутер подключается раньше основного, чтобы кнопки меню работали из любого состояния.
 """
+import html
 import logging
 import re
 from datetime import date, datetime, timedelta
@@ -90,7 +91,7 @@ async def cf_cancel(callback: CallbackQuery, state: FSMContext):
 
 OBLIGATIONS_INTRO = (
     "📌 <b>Обязательные расходы</b>\n\n"
-    "Что ты платишь каждый месяц в любом случае? Пиши по одному в строку:\n"
+    "Что ты платишь каждый месяц в любом случае? Можно сразу списком — по расходу в строке:\n"
     "<code>название сумма день</code>\n\n"
     "Например:\n"
     "<code>Квартира 40000 2</code>\n"
@@ -152,20 +153,25 @@ async def obl_add(callback: CallbackQuery, state: FSMContext):
 
 @router.message(Obligations.add, NOT_MENU)
 async def obl_input(message: Message, state: FSMContext):
-    parsed = parse_obligation(message.text or "")
-    if not parsed:
-        await message.answer(
-            "Не понял 🤔 Формат: <code>название сумма день</code>, например <code>Квартира 40000 2</code>",
-            parse_mode="HTML"
-        )
-        return
-    name, amount, day = parsed
-    await db.add_obligation(message.from_user.id, name, amount, day)
-    when = f", {day}-го числа" if day else ""
-    await message.answer(
-        f"✅ {name} — {_rub(amount)}{when}\n\nЕщё? Пиши следующий или жми «Готово».",
-        reply_markup=_obligations_done_kb()
-    )
+    # Можно прислать сразу список — по расходу в строке
+    added, failed = [], []
+    for line in (message.text or "").splitlines():
+        if not line.strip():
+            continue
+        parsed = parse_obligation(line)
+        if not parsed:
+            failed.append(line.strip())
+            continue
+        name, amount, day = parsed
+        await db.add_obligation(message.from_user.id, name, amount, day)
+        added.append(f"✅ {html.escape(name)} — {_rub(amount)}" + (f", {day}-го числа" if day else ""))
+
+    lines = added[:]
+    if failed:
+        lines.append("\nНе понял 🤔 " + ", ".join(f"«{html.escape(f)}»" for f in failed))
+        lines.append("Формат: <code>название сумма день</code>, например <code>Квартира 40000 2</code>")
+    lines.append("\nЕщё? Пиши или жми «Готово».")
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=_obligations_done_kb())
 
 
 @router.callback_query(F.data == "obl_done")
